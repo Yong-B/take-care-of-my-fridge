@@ -63,6 +63,9 @@ public class KafkaConfig {
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         props.put(ProducerConfig.RETRIES_CONFIG, 3);
+        // Kafka가 멈췄을 때 send()가 메타데이터를 기다리며 호출 스레드를 붙잡는 시간 (기본 60초).
+        // 짧게 두어 발행 쪽이 오래 멈추지 않고 실패를 빨리 알게 한다. 보내지 못한 구매 확정은 outbox에 남아 다음 주기에 다시 보낸다
+        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000);
 
         JacksonJsonSerializer<Object> valueSerializer = new JacksonJsonSerializer<>(createKafkaJsonMapper());
         valueSerializer.setAddTypeInfo(false);

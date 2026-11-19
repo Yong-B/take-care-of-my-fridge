@@ -27,4 +27,14 @@ class OrderSchedulerLockTest {
         assertThat(lock).isNotNull();
         assertThat(lock.name()).isEqualTo("orderAutoConfirm");
     }
+
+    @Test
+    @DisplayName("구매 확정 outbox 발행 스케줄러는 서버 간 잠금을 건다")
+    void locksOutboxRelaySchedulerAcrossServers() throws NoSuchMethodException {
+        SchedulerLock lock = OrderOutboxRelayScheduler.class.getMethod("publishPending")
+                .getAnnotation(SchedulerLock.class);
+
+        assertThat(lock).isNotNull();
+        assertThat(lock.name()).isEqualTo("orderOutboxRelay");
+    }
 }
