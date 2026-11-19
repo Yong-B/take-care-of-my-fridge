@@ -7,11 +7,14 @@ import lombok.RequiredArgsConstructor;
 import org.example.takecareofmyfridgebe.domain.order.dto.OrderConfirmResponse;
 import org.example.takecareofmyfridgebe.domain.order.entity.Order;
 import org.example.takecareofmyfridgebe.domain.order.entity.OrderItem;
+import org.example.takecareofmyfridgebe.domain.order.entity.OrderOutboxEvent;
 import org.example.takecareofmyfridgebe.domain.order.entity.OrderStatus;
 import org.example.takecareofmyfridgebe.domain.order.event.OrderConfirmedEvent;
+import org.example.takecareofmyfridgebe.domain.order.event.OutboxPayloadMapper;
 import org.example.takecareofmyfridgebe.domain.order.repository.OrderItemRepository;
+import org.example.takecareofmyfridgebe.domain.order.repository.OrderOutboxEventRepository;
 import org.example.takecareofmyfridgebe.domain.order.repository.OrderRepository;
-import org.springframework.context.ApplicationEventPublisher;
+import org.example.takecareofmyfridgebe.global.config.kafka.KafkaTopics;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,7 +29,7 @@ public class OrderStatusService {
 
     private final OrderRepository orderRepository;
     private final OrderItemRepository orderItemRepository;
-    private final ApplicationEventPublisher eventPublisher;
+    private final OrderOutboxEventRepository orderOutboxEventRepository;
 
     // 주문 만료 스케줄러가 처리할 결제 대기 주문을 afterId 다음부터 id 순으로 조회한다.
     // 결제가 붙었는지는 여기서 거르지 않고 만료할 때 주문 행을 잠근 뒤 본다.
@@ -54,12 +57,18 @@ public class OrderStatusService {
     }
 
     // 확정 수량은 주문 수량에서 완료된 환불 수량을 뺀 값이다. 할인 상품은 환불이 없어 주문 수량과 같다.
-    // 이미 확정된 주문은 퍼사드가 먼저 돌려보내므로 처음 확정한 요청만 이벤트를 발행한다. 실제 발행은 커밋 뒤에 한다.
+    // 이미 확정된 주문은 퍼사드가 먼저 돌려보내므로 처음 확정한 요청만 구매 확정 이벤트를 outbox에 남긴다.
+    // 같은 트랜잭션에 저장해 확정이 커밋되면 이벤트도 남고 롤백되면 함께 사라진다. Kafka 발행은 OrderOutboxRelayScheduler가 한다.
     @Transactional
     public OrderConfirmResponse confirm(Order order, List<OrderItem> items, Map<Long, Long> completedRefundQuantities) {
         order.confirm(LocalDateTime.now());
         items.forEach(item -> item.confirmQuantity(completedRefundQuantities.getOrDefault(item.getId(), 0L)));
-        eventPublisher.publishEvent(OrderConfirmedEvent.of(order, items));
+        OrderConfirmedEvent event = OrderConfirmedEvent.of(order, items);
+        orderOutboxEventRepository.save(OrderOutboxEvent.builder()
+                .topic(KafkaTopics.PURCHASE_CONFIRMED)
+                .messageKey(String.valueOf(event.orderId()))
+                .payload(OutboxPayloadMapper.write(event))
+                .build());
         return OrderConfirmResponse.from(order);
     }
 

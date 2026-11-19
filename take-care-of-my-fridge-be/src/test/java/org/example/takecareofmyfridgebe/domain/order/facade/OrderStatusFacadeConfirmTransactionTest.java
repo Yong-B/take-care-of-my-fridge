@@ -9,7 +9,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -18,10 +17,14 @@ import java.util.concurrent.Future;
 import org.example.takecareofmyfridgebe.domain.order.dto.OrderConfirmResponse;
 import org.example.takecareofmyfridgebe.domain.order.entity.Order;
 import org.example.takecareofmyfridgebe.domain.order.entity.OrderItem;
+import org.example.takecareofmyfridgebe.domain.order.entity.OrderOutboxEvent;
 import org.example.takecareofmyfridgebe.domain.order.entity.OrderStatus;
+import org.example.takecareofmyfridgebe.domain.order.entity.OutboxStatus;
 import org.example.takecareofmyfridgebe.domain.order.entity.SaleType;
 import org.example.takecareofmyfridgebe.domain.order.event.OrderConfirmedEvent;
+import org.example.takecareofmyfridgebe.domain.order.event.OutboxPayloadMapper;
 import org.example.takecareofmyfridgebe.domain.order.repository.OrderItemRepository;
+import org.example.takecareofmyfridgebe.domain.order.repository.OrderOutboxEventRepository;
 import org.example.takecareofmyfridgebe.domain.order.repository.OrderRepository;
 import org.example.takecareofmyfridgebe.domain.order.service.OrderReader;
 import org.example.takecareofmyfridgebe.domain.order.service.OrderStatusService;
@@ -42,6 +45,7 @@ import org.example.takecareofmyfridgebe.domain.refund.service.RefundQueryService
 import org.example.takecareofmyfridgebe.domain.sale.service.SaleEventStockService;
 import org.example.takecareofmyfridgebe.global.config.jpa.JpaAuditingConfig;
 import org.example.takecareofmyfridgebe.global.config.jpa.QueryDslConfig;
+import org.example.takecareofmyfridgebe.global.config.kafka.KafkaTopics;
 import org.example.takecareofmyfridgebe.global.error.BusinessException;
 import org.example.takecareofmyfridgebe.global.error.ErrorCode;
 import org.example.takecareofmyfridgebe.support.MySqlContainerSupport;
@@ -52,19 +56,19 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
 import org.springframework.boot.jdbc.test.autoconfigure.AutoConfigureTestDatabase;
 import org.springframework.context.annotation.Import;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.event.TransactionPhase;
-import org.springframework.transaction.event.TransactionalEventListener;
+import org.springframework.transaction.support.TransactionTemplate;
 
 // 테스트 자체 트랜잭션을 끄고(NOT_SUPPORTED) 서비스의 트랜잭션 경계로 DB에 반영되는지 확인한다.
 // 응답이 아니라 커밋된 주문 상태, 확정 시각, 주문 상품의 확정 수량을 다시 읽어 확인한다.
-// 구매 확정 이벤트는 커밋 뒤에 받은 것만 모아 몇 번, 무엇이 나갔는지 확인한다.
+// 구매 확정 이벤트는 같은 트랜잭션에 저장된 outbox 행을 다시 읽어 몇 건, 무엇이 남았는지 확인한다.
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Import({JpaAuditingConfig.class, QueryDslConfig.class, OrderStatusFacade.class, OrderReader.class,
     RefundQueryService.class, RefundCommandService.class, PaymentHistoryRecorder.class,
-    OrderStatusFacadeConfirmTransactionTest.CommittedEvents.class, OrderStatusService.class,
+    OrderStatusService.class,
     SaleEventStockService.class, PaymentService.class})
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
@@ -76,7 +80,8 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
     private final PaymentRepository paymentRepository;
     private final RefundRepository refundRepository;
     private final RefundItemRepository refundItemRepository;
-    private final CommittedEvents committedEvents;
+    private final OrderOutboxEventRepository outboxRepository;
+    private final TransactionTemplate transactionTemplate;
 
     @Autowired
     OrderStatusFacadeConfirmTransactionTest(
@@ -87,7 +92,8 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         PaymentRepository paymentRepository,
         RefundRepository refundRepository,
         RefundItemRepository refundItemRepository,
-        CommittedEvents committedEvents
+        OrderOutboxEventRepository outboxRepository,
+        PlatformTransactionManager transactionManager
     ) {
         this.orderStatusFacade = orderStatusFacade;
         this.refundCommandService = refundCommandService;
@@ -96,7 +102,8 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         this.paymentRepository = paymentRepository;
         this.refundRepository = refundRepository;
         this.refundItemRepository = refundItemRepository;
-        this.committedEvents = committedEvents;
+        this.outboxRepository = outboxRepository;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     @AfterEach
@@ -106,7 +113,7 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         paymentRepository.deleteAll();
         orderItemRepository.deleteAll();
         orderRepository.deleteAll();
-        committedEvents.events.clear();
+        outboxRepository.deleteAll();
     }
 
     @Test
@@ -168,7 +175,7 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
     }
 
     @Test
-    @DisplayName("전액 환불된 주문은 전부 환불된 주문으로 거절하고 상태와 확정 수량은 그대로이며 이벤트도 보내지 않는다")
+    @DisplayName("전액 환불된 주문은 전부 환불된 주문으로 거절하고 상태와 확정 수량은 그대로이며 outbox에도 남지 않는다")
     void rejectsConfirmingRefundedOrder() {
         Order order = saveOrder(1L, OrderStatus.PAID);
         OrderItem item = saveItem(order, 2, SaleType.NONE);
@@ -181,7 +188,7 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         assertThat(unchanged.getStatus()).isEqualTo(OrderStatus.REFUNDED);
         assertThat(unchanged.getConfirmedAt()).isNull();
         assertThat(reload(item).getConfirmedQuantity()).isNull();
-        assertThat(committedEvents.events).isEmpty();
+        assertThat(outboxRepository.findAll()).isEmpty();
     }
 
     @Test
@@ -304,8 +311,8 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
     }
 
     @Test
-    @DisplayName("결제 완료 주문을 구매 확정하면 커밋 뒤 구매 확정 이벤트가 한 번 나가고 확정 수량이 남은 상품만 싣는다")
-    void publishesEventWithRemainingItemsWhenConfirmingPaidOrder() {
+    @DisplayName("결제 완료 주문을 구매 확정하면 구매 확정 이벤트가 대기 상태 outbox 한 건으로 남고 확정 수량이 남은 상품만 싣는다")
+    void savesPendingOutboxWithRemainingItems_whenConfirmingPaidOrder() {
         Order order = saveOrder(1L, OrderStatus.PAID);
         OrderItem remaining = saveItem(order, 3, SaleType.NONE);
         OrderItem allRefunded = saveItem(order, 2, SaleType.NONE);
@@ -313,8 +320,15 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
 
         orderStatusFacade.confirm(1L, order.getId());
 
-        assertThat(committedEvents.events).hasSize(1);
-        OrderConfirmedEvent event = committedEvents.events.get(0);
+        List<OrderOutboxEvent> outboxes = outboxRepository.findAll();
+        assertThat(outboxes).hasSize(1);
+        OrderOutboxEvent outbox = outboxes.get(0);
+        assertThat(outbox.getTopic()).isEqualTo(KafkaTopics.PURCHASE_CONFIRMED);
+        assertThat(outbox.getMessageKey()).isEqualTo(String.valueOf(order.getId()));
+        assertThat(outbox.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(outbox.getAttemptCount()).isZero();
+        assertThat(outbox.getPublishedAt()).isNull();
+        OrderConfirmedEvent event = readEvent(outbox);
         assertThat(event.orderId()).isEqualTo(order.getId());
         assertThat(event.memberId()).isEqualTo(1L);
         assertThat(event.confirmedAt()).isNotNull();
@@ -323,20 +337,20 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
     }
 
     @Test
-    @DisplayName("이미 구매 확정된 주문을 다시 확정하면 구매 확정 이벤트를 다시 보내지 않는다")
-    void doesNotPublishAgainForConfirmedOrder() {
+    @DisplayName("이미 구매 확정된 주문을 다시 확정하면 outbox를 다시 남기지 않는다")
+    void doesNotSaveOutboxAgain_whenOrderIsAlreadyConfirmed() {
         Order order = saveOrder(1L, OrderStatus.PAID);
         saveItem(order, 1, SaleType.NONE);
         orderStatusFacade.confirm(1L, order.getId());
 
         orderStatusFacade.confirm(1L, order.getId());
 
-        assertThat(committedEvents.events).hasSize(1);
+        assertThat(outboxRepository.findAll()).hasSize(1);
     }
 
     @Test
-    @DisplayName("요청 상태 환불이 있어 거절된 주문은 구매 확정 이벤트를 보내지 않는다")
-    void doesNotPublishWhenConfirmingWithRequestedRefund() {
+    @DisplayName("요청 상태 환불이 있어 거절된 주문은 outbox를 남기지 않는다")
+    void doesNotSaveOutbox_whenConfirmingWithRequestedRefund() {
         Order order = saveOrder(1L, OrderStatus.PAID);
         OrderItem item = saveItem(order, 3, SaleType.NONE);
         saveRefund(savePayment(order), item, 1, RefundStatus.REQUESTED);
@@ -344,12 +358,30 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         assertThatThrownBy(() -> orderStatusFacade.confirm(1L, order.getId()))
             .isInstanceOf(BusinessException.class);
 
-        assertThat(committedEvents.events).isEmpty();
+        assertThat(outboxRepository.findAll()).isEmpty();
     }
 
     @Test
-    @DisplayName("같은 주문을 동시에 10번 확정해도 구매 확정 이벤트는 한 번만 나간다")
-    void publishesOnceWhenConfirmingSameOrderConcurrently() throws Exception {
+    @DisplayName("구매 확정 뒤 같은 트랜잭션이 롤백되면 주문은 결제 완료 그대로이고 outbox에도 남지 않는다")
+    void leavesNoOutbox_whenConfirmTransactionRollsBack() {
+        Order order = saveOrder(1L, OrderStatus.PAID);
+        OrderItem item = saveItem(order, 2, SaleType.NONE);
+
+        assertThatThrownBy(() -> transactionTemplate.executeWithoutResult(status -> {
+            orderStatusFacade.confirm(1L, order.getId());
+            throw new IllegalStateException("확정 뒤 실패");
+        })).isInstanceOf(IllegalStateException.class);
+
+        Order unchanged = reload(order);
+        assertThat(unchanged.getStatus()).isEqualTo(OrderStatus.PAID);
+        assertThat(unchanged.getConfirmedAt()).isNull();
+        assertThat(reload(item).getConfirmedQuantity()).isNull();
+        assertThat(outboxRepository.findAll()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("같은 주문을 동시에 10번 확정해도 outbox는 한 건만 남는다")
+    void savesOutboxOnce_whenConfirmingSameOrderConcurrently() throws Exception {
         Order order = saveOrder(1L, OrderStatus.PAID);
         saveItem(order, 1, SaleType.NONE);
 
@@ -359,8 +391,9 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         }));
 
         assertThat(failures).isEmpty();
-        assertThat(committedEvents.events).hasSize(1);
-        assertThat(committedEvents.events.get(0).orderId()).isEqualTo(order.getId());
+        List<OrderOutboxEvent> outboxes = outboxRepository.findAll();
+        assertThat(outboxes).hasSize(1);
+        assertThat(readEvent(outboxes.get(0)).orderId()).isEqualTo(order.getId());
     }
 
     @Test
@@ -376,7 +409,7 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
     }
 
     @Test
-    @DisplayName("환불 뒤 구매 확정으로 부르면 바로 구매 확정되고 환불된 상품은 확정 수량 0, 번개 드롭 상품만 이벤트에 싣는다")
+    @DisplayName("환불 뒤 구매 확정으로 부르면 바로 구매 확정되고 환불된 상품은 확정 수량 0, 번개 드롭 상품만 outbox 이벤트에 싣는다")
     void confirmsAfterRefundWhenOnlyFlashDropRemains() {
         Order order = saveOrder(1L, OrderStatus.PAID);
         OrderItem normal = saveItem(order, 2, SaleType.NONE);
@@ -390,8 +423,9 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         assertThat(confirmed.getConfirmedAt()).isNotNull();
         assertThat(reload(normal).getConfirmedQuantity()).isZero();
         assertThat(reload(flashDrop).getConfirmedQuantity()).isEqualTo(1);
-        assertThat(committedEvents.events).hasSize(1);
-        assertThat(committedEvents.events.get(0).items()).containsExactly(
+        List<OrderOutboxEvent> outboxes = outboxRepository.findAll();
+        assertThat(outboxes).hasSize(1);
+        assertThat(readEvent(outboxes.get(0)).items()).containsExactly(
             new OrderConfirmedEvent.Item(flashDrop.getId(), 1L, "대파", 1));
     }
 
@@ -486,14 +520,8 @@ class OrderStatusFacadeConfirmTransactionTest extends MySqlContainerSupport {
         return orderItemRepository.findById(item.getId()).orElseThrow();
     }
 
-    // 실제 발행 리스너와 같은 시점(커밋 뒤)에 받아 둔다. 동시 확정 테스트는 여러 스레드에서 들어오므로 스레드 안전한 목록을 쓴다
-    static class CommittedEvents {
-
-        final List<OrderConfirmedEvent> events = new CopyOnWriteArrayList<>();
-
-        @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
-        void onOrderConfirmed(OrderConfirmedEvent event) {
-            events.add(event);
-        }
+    // 발행 스케줄러가 보낼 때와 같은 방법으로 저장된 JSON을 원래 이벤트로 되돌린다
+    private OrderConfirmedEvent readEvent(OrderOutboxEvent outbox) {
+        return OutboxPayloadMapper.read(outbox.getPayload(), OrderConfirmedEvent.class);
     }
 }
